@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS public.visitors (
   detection_date DATE NOT NULL DEFAULT CURRENT_DATE,
   detection_time TIME NOT NULL DEFAULT CURRENT_TIME,
   status TEXT NOT NULL DEFAULT 'Pending' CHECK (status IN ('Pending', 'Registered', 'Ignored')),
+  notes TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -75,6 +76,7 @@ ALTER TABLE public.visitors ADD COLUMN IF NOT EXISTS captured_face_url TEXT;
 ALTER TABLE public.visitors ADD COLUMN IF NOT EXISTS snapshot_url TEXT;
 ALTER TABLE public.visitors ADD COLUMN IF NOT EXISTS detection_date DATE NOT NULL DEFAULT CURRENT_DATE;
 ALTER TABLE public.visitors ADD COLUMN IF NOT EXISTS detection_time TIME NOT NULL DEFAULT CURRENT_TIME;
+ALTER TABLE public.visitors ADD COLUMN IF NOT EXISTS notes TEXT;
 
 -- ============================
 -- 5. ATTENDANCE TABLE
@@ -83,18 +85,28 @@ CREATE TABLE IF NOT EXISTS public.attendance (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   member_id UUID NOT NULL REFERENCES public.members(id) ON DELETE CASCADE,
   camera_id UUID REFERENCES public.camera_streams(id) ON DELETE SET NULL,
-  attendance_date DATE NOT NULL DEFAULT CURRENT_DATE,
-  check_in_time TIME NOT NULL DEFAULT CURRENT_TIME,
-  confidence_score FLOAT,
+  date DATE NOT NULL DEFAULT CURRENT_DATE,
+  time TIME NOT NULL DEFAULT CURRENT_TIME,
+  service_type TEXT NOT NULL DEFAULT 'Practice / Testing Session',
+  status TEXT NOT NULL DEFAULT 'Present',
+  marked_by TEXT,
   punctuality_status TEXT,
   minutes_difference INTEGER,
+  confidence_score FLOAT,
   source TEXT DEFAULT 'camera', -- 'camera' | 'kiosk' | 'manual'
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Add punctuality columns to existing table
+-- Add compatibility columns to existing table
+ALTER TABLE public.attendance ADD COLUMN IF NOT EXISTS date DATE;
+ALTER TABLE public.attendance ADD COLUMN IF NOT EXISTS time TIME;
+ALTER TABLE public.attendance ADD COLUMN IF NOT EXISTS service_type TEXT;
+ALTER TABLE public.attendance ADD COLUMN IF NOT EXISTS status TEXT;
+ALTER TABLE public.attendance ADD COLUMN IF NOT EXISTS marked_by TEXT;
 ALTER TABLE public.attendance ADD COLUMN IF NOT EXISTS punctuality_status TEXT;
 ALTER TABLE public.attendance ADD COLUMN IF NOT EXISTS minutes_difference INTEGER;
+ALTER TABLE public.attendance ADD COLUMN IF NOT EXISTS attendance_date DATE;
+ALTER TABLE public.attendance ADD COLUMN IF NOT EXISTS check_in_time TIME;
 
 -- ============================
 -- 6. ROW LEVEL SECURITY (optional but recommended)

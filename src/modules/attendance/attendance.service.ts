@@ -68,8 +68,19 @@ export class AttendanceService {
       };
     });
 
-    console.log(`[DEBUG] getAttendance returning ${mappedRecords.length} records. Count: ${count}`);
+    console.log(`[DEBUG] getAttendance filters:`, filters);
+    console.log(`[DEBUG] getAttendance returning ${mappedRecords.length} records. Count: ${count}. Error:`, error);
     return { items: mappedRecords, total: count };
+  }
+
+  // Debug helper - returns raw attendance rows (no mapping) for diagnostics
+  async debugRaw(limit = 100) {
+    const client = this.supabaseService.getClient();
+    const { data, error } = await client.from('attendance').select('*').limit(limit).order('created_at', { ascending: false });
+    if (error) {
+      throw new HttpException(error.message, HttpStatus.INTERNAL_SERVER_ERROR);
+    }
+    return data;
   }
 
   async markManually(body: { memberId: string; date?: string; time?: string; serviceType: string; status: string }) {

@@ -24,8 +24,13 @@ export class RecognitionController {
     return {
       success: true,
       matched: result.matched,
+      alreadyMarked: result.alreadyMarked,
+      alreadyCaptured: result.alreadyCaptured,
       memberId: result.memberId || null,
-      message: result.matched ? 'Attendance marked for known member' : 'Visitor captured and saved to pending',
+      message: result.alreadyMarked ? 'Attendance already marked' : 
+               result.matched ? 'Attendance marked for known member' : 
+               result.alreadyCaptured ? 'Visitor face already captured recently' :
+               'Visitor captured and saved to pending',
     };
   }
 }
