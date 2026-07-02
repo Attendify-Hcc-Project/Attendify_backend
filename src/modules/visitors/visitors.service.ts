@@ -13,13 +13,7 @@ export class VisitorsService {
     const client = this.supabaseService.getClient();
     let query = client
       .from('visitors')
-      .select(`
-        *,
-        camera_streams (
-          name,
-          location
-        )
-      `, { count: 'exact' });
+      .select('*', { count: 'exact' });
 
     if (filters.status) {
       query = query.eq('status', filters.status);
@@ -93,31 +87,27 @@ export class VisitorsService {
       status: 'Active',
     });
 
-    // 3. Attempt to copy face embedding from visitor image (best-effort, non-blocking)
-    if (visitor.captured_face_url) {
+    // 3. Copy face embedding from visitor to member_faces
+    if (visitor.notes && visitor.notes.startsWith('[')) {
       try {
-        const cropPath = visitor.captured_face_url.split('/visitor-images/')[1];
+        const embedding = visitor.notes;
+        const { error: dbErr } = await client
+          .from('member_faces')
+          .insert({
+            member_id: member.id,
+            face_type: 'front',
+            photo_url: visitor.captured_face_url,
+            embedding: embedding
+          });
 
-        if (cropPath) {
-          const { data: fileData, error: downloadErr } = await client.storage
-            .from('visitor-images')
-            .download(cropPath);
-
-          if (!downloadErr && fileData) {
-            const fileBuffer = Buffer.from(await fileData.arrayBuffer());
-
-            await this.membersService.registerFaceImage(
-              member.id,
-              'front',
-              fileBuffer,
-              `${visitorId}_front.jpg`
-            );
-          }
+        if (dbErr) {
+          console.error('Failed to insert member face from visitor notes:', dbErr.message);
         }
       } catch (err) {
-        // Log error but do not crash member creation — face can be re-registered later
         console.error('Failed to copy visitor face embedding to member faces:', err?.message || err);
       }
+    } else {
+      console.warn('Visitor had no face descriptor stored in notes. Face will need to be re-registered manually.');
     }
 
     // 4. Update visitor status to 'Registered'

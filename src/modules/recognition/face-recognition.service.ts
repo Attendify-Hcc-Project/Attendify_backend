@@ -75,13 +75,20 @@ export class FaceRecognitionService implements OnModuleInit {
       for (const det of detections) {
         const box = det.detection.box;
 
-        // Crop the detected face
-        const faceCanvas = new Canvas(box.width, box.height);
+        // Pad the crop by 30% so face-api can detect it reliably later
+        const padW = box.width * 0.3;
+        const padH = box.height * 0.3;
+        const x = Math.max(0, box.x - padW);
+        const y = Math.max(0, box.y - padH);
+        const width = Math.min(img.width - x, box.width + padW * 2);
+        const height = Math.min(img.height - y, box.height + padH * 2);
+
+        const faceCanvas = new Canvas(width, height);
         const faceCtx = faceCanvas.getContext('2d');
         faceCtx.drawImage(
           img,
-          box.x, box.y, box.width, box.height,
-          0, 0, box.width, box.height
+          x, y, width, height,
+          0, 0, width, height
         );
 
         results.push({

@@ -1,12 +1,17 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { SupabaseService } from '../supabase/supabase.service';
 import { FaceRecognitionService } from './face-recognition.service';
 import { RecognitionGateway } from './recognition.gateway';
 import * as crypto from 'crypto';
 
+interface RecentUnknownVisitor {
+  descriptor: number[];
+  timestamp: number;
+}
+
 @Injectable()
-export class RecognitionProcessingService {
+export class RecognitionProcessingService implements OnModuleInit {
   private readonly logger = new Logger(RecognitionProcessingService.name);
 
   constructor(
@@ -15,6 +20,69 @@ export class RecognitionProcessingService {
     private recognitionGateway: RecognitionGateway,
     private configService: ConfigService,
   ) {}
+
+  private recentUnknownVisitors: RecentUnknownVisitor[] = [];
+
+  async onModuleInit() {
+    try {
+      const client = this.supabaseService.getClient();
+      const today = new Date().toISOString().split('T')[0];
+      
+      const { data: visitors } = await client
+        .from('visitors')
+        .select('notes, detection_time')
+        .eq('status', 'Pending')
+        .eq('detection_date', today);
+
+      if (visitors && visitors.length > 0) {
+        let loadedCount = 0;
+        for (const v of visitors) {
+          if (v.notes && v.notes.startsWith('[')) {
+            try {
+              const descriptor = JSON.parse(v.notes);
+              // convert detection_time to a rough timestamp for today
+              const [hours, minutes, seconds] = v.detection_time.split(':');
+              const d = new Date();
+              d.setHours(parseInt(hours), parseInt(minutes), parseInt(seconds), 0);
+              
+              this.recentUnknownVisitors.push({
+                descriptor,
+                timestamp: d.getTime()
+              });
+              loadedCount++;
+            } catch (e) {}
+          }
+        }
+        this.logger.log(`Loaded ${loadedCount} pending visitors into deduplication cache from DB.`);
+      }
+    } catch (err) {
+      this.logger.error('Failed to load pending visitors for deduplication cache', err);
+    }
+  }
+
+  private isDuplicateUnknown(descriptor: number[]): boolean {
+    const now = Date.now();
+    // Clean up older than 12 hours
+    this.recentUnknownVisitors = this.recentUnknownVisitors.filter(v => now - v.timestamp < 12 * 60 * 60 * 1000);
+    
+    const threshold = parseFloat(this.configService.get<string>('RECOGNITION_THRESHOLD') || '0.6');
+    // Using euclidean distance logic that face-api typically uses
+    for (const v of this.recentUnknownVisitors) {
+      let sum = 0;
+      for (let i = 0; i < descriptor.length; i++) {
+        sum += Math.pow(descriptor[i] - v.descriptor[i], 2);
+      }
+      const distance = Math.sqrt(sum);
+      // for Euclidean distance, lower is better. Assuming threshold is around 0.5 - 0.6 for a match.
+      // If we are doing similarity (inner product) we might need cosine distance. 
+      // But typically distance < 0.5 is a match for euclidean. Let's use 0.5 as safe cutoff.
+      if (distance < 0.55) {
+        return true;
+      }
+    }
+    this.recentUnknownVisitors.push({ descriptor: Array.from(descriptor), timestamp: now });
+    return false;
+  }
 
   /**
    * Processes a kiosk frame — tries face recognition first,
@@ -43,8 +111,15 @@ export class RecognitionProcessingService {
             const isAlreadyMarked = await this.markMatchAttendance(matches[0].member_id, cameraName);
             return { matched: true, memberId: matches[0].member_id, alreadyMarked: isAlreadyMarked };
           } else {
-            // Detected face but not in database — save as visitor with crop
-            await this.processUnknownVisitor(null, cameraName, frameBuffer, det.croppedBuffer);
+            // Detected face but not in database — check if duplicate unknown
+            const isDuplicate = this.isDuplicateUnknown(Array.from(det.descriptor));
+            if (isDuplicate) {
+              this.logger.log(`Skipping duplicate unknown visitor for camera: ${cameraName}`);
+              return { matched: false, alreadyMarked: false };
+            }
+
+            // Save as visitor with crop
+            await this.processUnknownVisitor(null, cameraName, frameBuffer, det.croppedBuffer, det.descriptor);
             return { matched: false, alreadyMarked: false };
           }
         }
@@ -52,13 +127,13 @@ export class RecognitionProcessingService {
 
       // No face detected at all — still save the raw snapshot so nothing is lost
       this.logger.warn(`No face detected by face-api; saving raw snapshot as visitor.`);
-      await this.processUnknownVisitor(null, cameraName, frameBuffer, frameBuffer);
+      await this.processUnknownVisitor(null, cameraName, frameBuffer, frameBuffer, new Float32Array(128));
       return { matched: false };
     } catch (err) {
       this.logger.error(`Kiosk frame processing failed`, err);
       // Even on error try to save snapshot
       try {
-        await this.processUnknownVisitor(null, cameraName, frameBuffer, frameBuffer);
+        await this.processUnknownVisitor(null, cameraName, frameBuffer, frameBuffer, new Float32Array(128));
       } catch (_) {}
       return { matched: false };
     }
@@ -91,7 +166,10 @@ export class RecognitionProcessingService {
         if (matches && matches.length > 0) {
           await this.markMatchAttendance(matches[0].member_id, cameraName);
         } else {
-          await this.processUnknownVisitor(cameraId, cameraName, frameBuffer, det.croppedBuffer);
+          const isDuplicate = this.isDuplicateUnknown(Array.from(det.descriptor));
+          if (!isDuplicate) {
+            await this.processUnknownVisitor(cameraId, cameraName, frameBuffer, det.croppedBuffer, det.descriptor);
+          }
         }
       }
     } catch (err) {
@@ -105,12 +183,25 @@ export class RecognitionProcessingService {
   private async markMatchAttendance(memberId: string, cameraName: string) {
     const client = this.supabaseService.getClient();
     const now = new Date();
-    // Use local time for logic (important for correct day mapping)
-    const today = new Date(now.getTime() - now.getTimezoneOffset() * 60000).toISOString().split('T')[0];
-    const currentTime = now.toTimeString().split(' ')[0];
+
+    // Use the server's OS local time — Node.js getHours/getDay/etc. all respect the OS timezone.
+    // This correctly reflects the actual local time wherever the server is running.
+    const localYear  = now.getFullYear();
+    const localMonth = String(now.getMonth() + 1).padStart(2, '0');
+    const localDay   = String(now.getDate()).padStart(2, '0');
+    const localHour  = now.getHours();
+    const localMin   = now.getMinutes();
+    const localSec   = now.getSeconds();
+
+    const today       = `${localYear}-${localMonth}-${localDay}`;
+    const currentTime = `${String(localHour).padStart(2,'0')}:${String(localMin).padStart(2,'0')}:${String(localSec).padStart(2,'0')}`;
+
+    this.logger.log(`[Attendance] System local time: ${today} ${currentTime}, Day=${now.getDay()} (0=Sun,1=Mon...4=Thu)`);
 
     const activeService = this.getActiveServiceDetails(now);
     const serviceType = activeService.name;
+
+    this.logger.log(`[Attendance] Detected service: "${serviceType}"`);
 
     // Load member name & details early so we can broadcast errors
     const { data: member } = await client
@@ -143,9 +234,9 @@ export class RecognitionProcessingService {
       return true;
     }
 
-    // Calculate punctuality
-    const currentMins = now.getHours() * 60 + now.getMinutes();
-    const startMins = activeService.startTimeHour * 60 + activeService.startTimeMinute;
+    // Calculate punctuality using system local hour/minute
+    const currentMins = localHour * 60 + localMin;
+    const startMins   = activeService.startTimeHour * 60 + activeService.startTimeMinute;
     const minutes_difference = currentMins - startMins; // Negative = early, positive = late
     
     let punctuality_status = 'On Time';
@@ -188,7 +279,7 @@ export class RecognitionProcessingService {
   /**
    * Processes unknown face: uploads files, saves record, broadcasts ws alert
    */
-  private async processUnknownVisitor(cameraId: string | null, cameraName: string, snapshot: Buffer, crop: Buffer) {
+  private async processUnknownVisitor(cameraId: string | null, cameraName: string, snapshot: Buffer, crop: Buffer, descriptor: Float32Array) {
     const client = this.supabaseService.getClient();
     const visitorId = crypto.randomUUID();
     const today = new Date().toISOString().split('T')[0];
@@ -207,6 +298,8 @@ export class RecognitionProcessingService {
         
         if (!err1) {
           snapshotUrl = client.storage.from('camera-snapshots').getPublicUrl(snapshotPath).data.publicUrl;
+        } else {
+          this.logger.error(`Snapshot upload failed: ${err1.message}`);
         }
       }
 
@@ -218,12 +311,18 @@ export class RecognitionProcessingService {
         
         if (!err2) {
           cropUrl = client.storage.from('visitor-images').getPublicUrl(cropPath).data.publicUrl;
+        } else {
+          this.logger.error(`Crop upload failed: ${err2.message}`);
         }
       }
 
       // Default fallback images for demonstration if upload is bypassed
-      if (!snapshotUrl) snapshotUrl = 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=400';
-      if (!cropUrl) cropUrl = 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150';
+      // if (!snapshotUrl) snapshotUrl = 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=400';
+      // if (!cropUrl) cropUrl = 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150';
+      
+      if (!snapshotUrl || !cropUrl) {
+          throw new Error('Failed to upload snapshot or crop to Supabase Storage.');
+      }
 
       // Insert visitor record
       const insertPayload: any = {
@@ -232,7 +331,8 @@ export class RecognitionProcessingService {
         snapshot_url: snapshotUrl,
         detection_date: today,
         detection_time: currentTime,
-        status: 'Pending'
+        status: 'Pending',
+        notes: `[${Array.from(descriptor).join(',')}]`
       };
       
       if (cameraId) {
@@ -266,25 +366,63 @@ export class RecognitionProcessingService {
     }
   }
 
-  private getActiveServiceDetails(now: Date): { name: string, startTimeHour: number, startTimeMinute: number } {
-    const day = now.getDay();
-    const hour = now.getHours();
-    const mins = now.getMinutes();
+  private getActiveServiceDetails(localNow: Date): { name: string, startTimeHour: number, startTimeMinute: number } {
+    // ─── DEVELOPER TEST OVERRIDE ──────────────────────────────────────────────
+    // If DEV_SERVICE_OVERRIDE is set in .env, skip real-time detection entirely.
+    // Remove the env var before going live.
+    const devOverride = process.env.DEV_SERVICE_OVERRIDE?.trim();
+    if (devOverride) {
+      this.logger.warn(`[DEV MODE] Service overridden to: "${devOverride}" — remove DEV_SERVICE_OVERRIDE from .env for production!`);
+      return { name: devOverride, startTimeHour: localNow.getHours(), startTimeMinute: localNow.getMinutes() };
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
+    const day = localNow.getDay();       // 0=Sun,1=Mon,2=Tue,3=Wed,4=Thu,5=Fri,6=Sat
+    const hour = localNow.getHours();
+    const mins = localNow.getMinutes();
     const currentMins = hour * 60 + mins;
 
-    if (day === 0) { // Sunday
-      if (currentMins >= 6 * 60 && currentMins < 10 * 60) return { name: 'Sunday First Service', startTimeHour: 8, startTimeMinute: 0 };
-      if (currentMins >= 10 * 60 && currentMins <= 14 * 60) return { name: 'Sunday Second Service', startTimeHour: 10, startTimeMinute: 0 };
-    } else if (day === 2) { // Tuesday
-      if (currentMins >= 7 * 60 && currentMins <= 14 * 60) return { name: 'Breakthrough Service', startTimeHour: 9, startTimeMinute: 0 };
-    } else if (day === 4) { // Thursday
-      if (currentMins >= 15 * 60 && currentMins <= 21 * 60) return { name: 'Empowerment Service', startTimeHour: 17, startTimeMinute: 30 };
-    } else if (day === 6) { // Saturday
-      if (currentMins >= 7 * 60 && currentMins <= 13 * 60) return { name: 'Fire Service', startTimeHour: 9, startTimeMinute: 0 };
+
+    // Helper to determine Sunday theme based on week-of-month
+    const getSundayTheme = (d: Date) => {
+      const dayOfMonth = d.getDate();
+      const month = d.getMonth();
+      const year = d.getFullYear();
+      const daysInMonth = new Date(year, month + 1, 0).getDate();
+      // Find last Sunday of month
+      const lastDay = new Date(year, month, daysInMonth);
+      const lastSundayDate = daysInMonth - lastDay.getDay();
+
+      if (dayOfMonth >= lastSundayDate) return 'Communion Service';
+      if (dayOfMonth <= 7)  return 'Thanksgiving Service';
+      if (dayOfMonth <= 14) return 'Family Service';
+      return 'Normal Service';
+    };
+
+    // ----- Service Schedule (HCC Achievers Arena Abuja) -----
+    // Sunday: First Service 8am–10am, Second Service 10am–12pm
+    if (day === 0) {
+      const theme = getSundayTheme(localNow);
+      if (currentMins >= 7 * 60 && currentMins < 10 * 60) {
+        return { name: `Sunday First Service – ${theme}`, startTimeHour: 8, startTimeMinute: 0 };
+      }
+      if (currentMins >= 10 * 60 && currentMins < 13 * 60) {
+        return { name: `Sunday Second Service – ${theme}`, startTimeHour: 10, startTimeMinute: 0 };
+      }
     }
-    
-    // Fallback if checked in outside normal hours (e.g., testing or special event)
-    return { name: 'General Gathering / Testing', startTimeHour: hour, startTimeMinute: 0 };
+
+    // Tuesday: Breakthrough Fire Service 9am–11am
+    if (day === 2 && currentMins >= 8 * 60 && currentMins <= 12 * 60) {
+      return { name: 'Breakthrough Fire Service', startTimeHour: 9, startTimeMinute: 0 };
+    }
+
+    // Thursday: Empowerment Service 5:30pm–7:30pm
+    if (day === 4 && currentMins >= 16 * 60 && currentMins <= 21 * 60) {
+      return { name: 'Empowerment Service', startTimeHour: 17, startTimeMinute: 30 };
+    }
+
+    // Outside scheduled service hours — label clearly as practice/testing
+    return { name: 'Practice / Testing Session', startTimeHour: hour, startTimeMinute: mins };
   }
 
   private async getCameraLocation(cameraId: string): Promise<string> {

@@ -76,6 +76,7 @@ export class MembersService {
       .insert({
         first_name: body.firstName,
         last_name: body.lastName,
+        full_name: `${body.firstName} ${body.lastName}`,
         phone_number: body.phoneNumber || null,
         email: body.email || null,
         gender: body.gender,

@@ -16,6 +16,7 @@ export class AttendanceService {
         members (
           first_name,
           last_name,
+          full_name,
           department,
           profile_photo_url
         )
@@ -44,12 +45,31 @@ export class AttendanceService {
       records = records.filter(r => {
         const member = r.members as any;
         if (!member) return false;
-        const fullName = `${member.first_name || ''} ${member.last_name || ''}`.toLowerCase();
-        return fullName.includes(searchLower);
+        const fullName = member.full_name || `${member.first_name || ''} ${member.last_name || ''}`;
+        return fullName.toLowerCase().includes(searchLower);
       });
     }
 
-    return { records, totalCount: count };
+    // Map records to include member_name for frontend
+    const mappedRecords = records.map(r => {
+      const member = r.members as any;
+      const rawMarkedBy: string = r.marked_by || '';
+      return {
+        ...r,
+        member_name: member?.full_name || `${member?.first_name || ''} ${member?.last_name || ''}`.trim() || 'Unknown',
+        member_photo: member?.profile_photo_url || null,
+        service_session: r.service_type,
+        marked_at: r.created_at || `${r.date}T${r.time}`,
+        // Normalize status to lowercase so frontend STATUS_CONFIG matches
+        status: (r.status || 'present').toLowerCase(),
+        // Map marked_by to 'ai' or 'manual' for frontend badge
+        marked_by: rawMarkedBy.toUpperCase().startsWith('AI') ? 'ai' : 'manual',
+        marked_by_label: rawMarkedBy, // keep original label for display
+      };
+    });
+
+    console.log(`[DEBUG] getAttendance returning ${mappedRecords.length} records. Count: ${count}`);
+    return { items: mappedRecords, total: count };
   }
 
   async markManually(body: { memberId: string; date?: string; time?: string; serviceType: string; status: string }) {
@@ -133,7 +153,7 @@ export class AttendanceService {
     const [members, todayAtt, cameras] = await Promise.all([
       client.from('members').select('id', { count: 'exact', head: true }),
       client.from('attendance').select('id', { count: 'exact', head: true }).eq('date', today),
-      client.from('cameras').select('id', { count: 'exact', head: true }).eq('status', 'active'),
+      client.from('camera_streams').select('id', { count: 'exact', head: true }).eq('status', 'active'),
     ]);
 
     const unknownRes = await client
@@ -202,17 +222,14 @@ export class AttendanceService {
    * Generates a raw CSV spreadsheet string containing the filtered check-in logs
    */
   async exportCsv(filters: { date?: string; serviceType?: string }) {
-    const { records } = await this.findAll({ ...filters, limit: 10000 });
+    const { items: records } = await this.findAll({ ...filters, limit: 10000 });
     
-    let csv = 'ID,Name,Email,Department,Date,Time,Service,Status,Marked By\n';
+    let csv = 'ID,Name,Department,Date,Time,Service,Status,Marked By\n';
     
-    for (const r of records) {
-      const member = r.members as any;
-      const name = member ? `"${member.first_name || ''} ${member.last_name || ''}"` : 'Unknown';
-      const email = member ? `"${member.email || ''}"` : 'Unknown';
-      const dept = member ? `"${member.department || ''}"` : 'Unknown';
-      
-      csv += `${r.id},${name},${email},${dept},${r.date},${r.time},"${r.service_type}",${r.status},"${r.marked_by}"\n`;
+    for (const r of records as any[]) {
+      const name = `"${r.member_name || 'Unknown'}"`;
+      const dept = `"${(r.members as any)?.department || ''}"`;
+      csv += `${r.id},${name},${dept},${r.date},${r.time},"${r.service_type}",${r.status},"${r.marked_by}"\n`;
     }
 
     return csv;
