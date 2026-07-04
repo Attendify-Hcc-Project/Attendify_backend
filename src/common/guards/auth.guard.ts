@@ -1,6 +1,5 @@
 import { CanActivate, ExecutionContext, Injectable, UnauthorizedException } from '@nestjs/common';
 import { SupabaseService } from '../../modules/supabase/supabase.service';
-import * as jwt from 'jsonwebtoken';
 
 @Injectable()
 export class AuthGuard implements CanActivate {
@@ -41,7 +40,7 @@ export class AuthGuard implements CanActivate {
       return true;
     } catch (err) {
       console.error('[AuthGuard] Token verification failed:', err?.message || err);
-      throw new UnauthorizedException(Session expired or invalid token: \);
+      throw new UnauthorizedException(`Session expired or invalid token: ${err?.message}`);
     }
   }
 }
