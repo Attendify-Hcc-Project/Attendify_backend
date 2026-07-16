@@ -1,3 +1,4 @@
+import * as crypto from 'crypto';
 import { Injectable, HttpException, HttpStatus, Logger } from '@nestjs/common';
 import { SupabaseService } from '../supabase/supabase.service';
 import { FaceRecognitionService } from '../recognition/face-recognition.service';
@@ -68,6 +69,7 @@ export class MembersService {
     gender: string;
     dateOfBirth?: string;
     department?: string;
+    address?: string;
     status?: string;
     profilePhotoUrl?: string;
   }) {
@@ -84,6 +86,8 @@ export class MembersService {
         department: body.department || null,
         membership_status: body.status || 'Active',
         profile_photo_url: body.profilePhotoUrl || null,
+        address: body.address || null,
+        qr_code: require('crypto').randomUUID(),
       })
       .select()
       .single();
@@ -106,6 +110,7 @@ export class MembersService {
     if (body.department !== undefined) updateData.department = body.department;
     if (body.status !== undefined) updateData.membership_status = body.status;
     if (body.profilePhotoUrl !== undefined) updateData.profile_photo_url = body.profilePhotoUrl;
+    if (body.address !== undefined) updateData.address = body.address;
 
     const { data, error } = await this.supabaseService.getClient()
       .from('members')

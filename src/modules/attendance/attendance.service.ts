@@ -73,6 +73,75 @@ export class AttendanceService {
     return { items: mappedRecords, total: count };
   }
 
+
+  async lookupByPhone(last4: string) {
+    const client = this.supabaseService.getClient();
+    const { data, error } = await client
+      .from('members')
+      .select('id, full_name, profile_photo_url, phone_number')
+      .like('phone_number', `%${last4}`);
+    
+    if (error) {
+      throw new HttpException(error.message, HttpStatus.INTERNAL_SERVER_ERROR);
+    }
+    return data;
+  }
+
+  async lookupByQrCode(qrCode: string) {
+    const client = this.supabaseService.getClient();
+    const { data, error } = await client
+      .from('members')
+      .select('id, full_name, profile_photo_url, phone_number, qr_code')
+      .eq('qr_code', qrCode)
+      .maybeSingle();
+    
+    if (error) {
+      throw new HttpException(error.message, HttpStatus.INTERNAL_SERVER_ERROR);
+    }
+    if (!data) {
+      throw new HttpException('Member not found with this QR code', HttpStatus.NOT_FOUND);
+    }
+    return data;
+  }
+
+  async markAttendance(body: { memberId: string; serviceType: string; method: string; status?: string }) {
+    const client = this.supabaseService.getClient();
+    const date = new Date().toISOString().split('T')[0];
+    const time = new Date().toTimeString().split(' ')[0];
+
+    const { data: existing } = await client
+      .from('attendance')
+      .select('*')
+      .eq('member_id', body.memberId)
+      .eq('date', date)
+      .eq('service_type', body.serviceType)
+      .maybeSingle();
+
+    if (existing) {
+      throw new HttpException('Attendance already recorded for this member and service session', HttpStatus.CONFLICT);
+    }
+
+    const { data, error } = await client
+      .from('attendance')
+      .insert({
+        member_id: body.memberId,
+        date,
+        time,
+        service_type: body.serviceType,
+        status: body.status || 'present',
+        marked_by: body.method === 'QR Code' ? 'QR Check-in' : 'Phone Check-in',
+        method: body.method
+      })
+      .select()
+      .single();
+
+    if (error) {
+      throw new HttpException(error.message, HttpStatus.BAD_REQUEST);
+    }
+
+    return data;
+  }
+
   // Debug helper - returns raw attendance rows (no mapping) for diagnostics
   async debugRaw(limit = 100) {
     const client = this.supabaseService.getClient();

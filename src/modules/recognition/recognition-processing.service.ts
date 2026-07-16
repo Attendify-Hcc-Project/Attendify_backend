@@ -143,7 +143,6 @@ export class RecognitionProcessingService implements OnModuleInit {
           if (v.notes && v.notes.startsWith('[')) {
             try {
               const descriptor = JSON.parse(v.notes);
-              // convert detection_time to a rough timestamp for today
               const [hours, minutes, seconds] = v.detection_time.split(':');
               const d = new Date();
               d.setHours(parseInt(hours), parseInt(minutes), parseInt(seconds), 0);
@@ -165,20 +164,15 @@ export class RecognitionProcessingService implements OnModuleInit {
 
   private isDuplicateUnknown(descriptor: number[]): boolean {
     const now = Date.now();
-    // Clean up older than 12 hours
     this.recentUnknownVisitors = this.recentUnknownVisitors.filter(v => now - v.timestamp < 12 * 60 * 60 * 1000);
 
     const threshold = parseFloat(this.configService.get<string>('RECOGNITION_THRESHOLD') || '0.6');
-    // Using euclidean distance logic that face-api typically uses
     for (const v of this.recentUnknownVisitors) {
       let sum = 0;
       for (let i = 0; i < descriptor.length; i++) {
         sum += Math.pow(descriptor[i] - v.descriptor[i], 2);
       }
       const distance = Math.sqrt(sum);
-      // for Euclidean distance, lower is better. Assuming threshold is around 0.5 - 0.6 for a match.
-      // If we are doing similarity (inner product) we might need cosine distance. 
-      // But typically distance < 0.5 is a match for euclidean. Let's use 0.5 as safe cutoff.
       if (distance < 0.55) {
         return true;
       }
@@ -193,17 +187,22 @@ export class RecognitionProcessingService implements OnModuleInit {
    * This guarantees every kiosk capture appears in the Pending visitors tab.
    */
   async processKioskFrame(cameraName: string, frameBuffer: Buffer): Promise<{ matched: boolean; memberId?: string; alreadyMarked?: boolean; alreadyCaptured?: boolean }> {
-    this.logger.log(`Kiosk frame received. Buffer size: ${frameBuffer.length}`);
+    this.logger.log(`[KIOSK] Frame received. Buffer size: ${frameBuffer.length}`);
     try {
-      const detections = await this.faceRecognitionService.processImageBuffer(frameBuffer);
-      this.logger.log(`Kiosk face detections: ${detections.length}`);
+      let detections: any[] = [];
+      try {
+        detections = await this.faceRecognitionService.processImageBuffer(frameBuffer);
+      } catch (faceErr: any) {
+        this.logger.warn(`[KIOSK] Face detection threw error: ${faceErr?.message}. Will save raw image.`);
+      }
+      this.logger.log(`[KIOSK] Face detections: ${detections.length}`);
 
       if (detections.length > 0) {
         const client = this.supabaseService.getClient();
         const threshold = parseFloat(this.configService.get<string>('RECOGNITION_THRESHOLD') || '0.6');
 
         for (const det of detections) {
-          const descriptor = Array.from(det.descriptor);
+          const descriptor = Array.from(det.descriptor) as number[];
           const bestMemberMatch = await this.findBestMemberMatch(client, descriptor, threshold);
 
           if (bestMemberMatch) {
@@ -211,33 +210,91 @@ export class RecognitionProcessingService implements OnModuleInit {
             return { matched: true, memberId: bestMemberMatch.memberId, alreadyMarked: isAlreadyMarked };
           }
 
-          const isDuplicate = this.isDuplicateUnknown(descriptor);
-          if (isDuplicate) {
-            this.logger.log(`Skipping duplicate unknown visitor for camera: ${cameraName}`);
-            return { matched: false, alreadyMarked: false, alreadyCaptured: true };
-          }
-
-          const existingVisitor = await this.findSimilarPendingVisitor(client, descriptor, threshold);
-          if (existingVisitor) {
-            this.logger.log(`Skipping repeated pending visitor capture for camera: ${cameraName}`);
-            return { matched: false, alreadyMarked: false, alreadyCaptured: true };
-          }
-
+          // Not a known member - save as visitor with cropped face
           await this.processUnknownVisitor(null, cameraName, frameBuffer, det.croppedBuffer, det.descriptor);
           return { matched: false, alreadyMarked: false, alreadyCaptured: false };
         }
       }
 
-      this.logger.warn(`No face detected by face-api; skipping visitor capture.`);
-      return { matched: false };
-    } catch (err) {
-      this.logger.error(`Kiosk frame processing failed`, err);
-      // Even on error try to save snapshot
+      // No face detected OR face-api threw. ALWAYS save the raw frame for kiosk captures.
+      this.logger.log(`[KIOSK] No face detected by face-api. Saving raw frame as visitor.`);
+      await this.saveKioskRawVisitor(cameraName, frameBuffer);
+      return { matched: false, alreadyMarked: false, alreadyCaptured: false };
+    } catch (err: any) {
+      this.logger.error(`[KIOSK] Frame processing failed: ${err?.message}`, err?.stack);
+      // Last resort: try saving raw frame
       try {
-        await this.processUnknownVisitor(null, cameraName, frameBuffer, frameBuffer, new Float32Array(128));
-      } catch (_) { }
+        await this.saveKioskRawVisitor(cameraName, frameBuffer);
+      } catch (e: any) {
+        this.logger.error(`[KIOSK] Even raw save failed: ${e?.message}`);
+      }
       return { matched: false };
     }
+  }
+
+  /**
+   * Saves a raw kiosk frame directly as a visitor — bypasses face detection entirely.
+   * Used when face-api cannot find a face in the image.
+   */
+  private async saveKioskRawVisitor(cameraName: string, frameBuffer: Buffer) {
+    const client = this.supabaseService.getClient();
+    const visitorId = crypto.randomUUID();
+    const today = new Date().toISOString().split('T')[0];
+    const currentTime = new Date().toTimeString().split(' ')[0];
+
+    // Upload snapshot
+    const snapshotPath = `snapshots/${visitorId}_snapshot.jpg`;
+    const { error: snapErr } = await client.storage
+      .from('camera-snapshots')
+      .upload(snapshotPath, frameBuffer, { contentType: 'image/jpeg' });
+
+    if (snapErr) {
+      this.logger.error(`[KIOSK] Snapshot upload failed: ${snapErr.message}`);
+      throw snapErr;
+    }
+    const snapshotUrl = client.storage.from('camera-snapshots').getPublicUrl(snapshotPath).data.publicUrl;
+
+    // Upload crop (same image for raw saves)
+    const cropPath = `crops/${visitorId}_crop.jpg`;
+    const { error: cropErr } = await client.storage
+      .from('visitor-images')
+      .upload(cropPath, frameBuffer, { contentType: 'image/jpeg' });
+
+    if (cropErr) {
+      this.logger.error(`[KIOSK] Crop upload failed: ${cropErr.message}`);
+      throw cropErr;
+    }
+    const cropUrl = client.storage.from('visitor-images').getPublicUrl(cropPath).data.publicUrl;
+
+    // Insert visitor record
+    const { data: visitor, error: insertErr } = await client
+      .from('visitors')
+      .insert({
+        id: visitorId,
+        captured_face_url: cropUrl,
+        snapshot_url: snapshotUrl,
+        detection_date: today,
+        detection_time: currentTime,
+        status: 'Pending',
+        notes: 'Kiosk capture (no face detected)',
+      })
+      .select()
+      .single();
+
+    if (insertErr) {
+      this.logger.error(`[KIOSK] Visitor DB insert failed: ${JSON.stringify(insertErr)}`);
+      throw insertErr;
+    }
+    this.logger.log(`[KIOSK] Visitor saved to database: ${visitor.id}`);
+
+    this.recognitionGateway.broadcastVisitorDetected({
+      id: visitorId,
+      capturedFaceUrl: cropUrl,
+      snapshotUrl: snapshotUrl,
+      time: currentTime,
+      cameraName,
+      location: 'Live Kiosk',
+    });
   }
 
   /**
@@ -253,7 +310,7 @@ export class RecognitionProcessingService implements OnModuleInit {
       const threshold = parseFloat(this.configService.get<string>('RECOGNITION_THRESHOLD') || '0.6');
 
       for (const det of detections) {
-        const descriptor = Array.from(det.descriptor);
+        const descriptor = Array.from(det.descriptor) as number[];
         const bestMemberMatch = await this.findBestMemberMatch(client, descriptor, threshold);
 
         if (bestMemberMatch) {
@@ -280,8 +337,6 @@ export class RecognitionProcessingService implements OnModuleInit {
     const client = this.supabaseService.getClient();
     const now = new Date();
 
-    // Use the server's OS local time — Node.js getHours/getDay/etc. all respect the OS timezone.
-    // This correctly reflects the actual local time wherever the server is running.
     const localYear = now.getFullYear();
     const localMonth = String(now.getMonth() + 1).padStart(2, '0');
     const localDay = String(now.getDate()).padStart(2, '0');
@@ -299,7 +354,6 @@ export class RecognitionProcessingService implements OnModuleInit {
 
     this.logger.log(`[Attendance] Detected service: "${serviceType}"`);
 
-    // Load member name & details early so we can broadcast errors
     const { data: member } = await client
       .from('members')
       .select('first_name, last_name, profile_photo_url')
@@ -308,7 +362,6 @@ export class RecognitionProcessingService implements OnModuleInit {
 
     if (!member) return false;
 
-    // Check duplicate check-in window (already marked for this service today)
     const { data: existing } = await client
       .from('attendance')
       .select('*')
@@ -319,7 +372,6 @@ export class RecognitionProcessingService implements OnModuleInit {
 
     if (existing) {
       this.logger.log(`Member ${memberId} already checked in today for ${serviceType}`);
-      // Emit live WebSocket event so the kiosk UI shows "Already Marked"
       this.recognitionGateway.server.emit('visitor_detected', {
         id: crypto.randomUUID(),
         alreadyMarked: true,
@@ -330,16 +382,14 @@ export class RecognitionProcessingService implements OnModuleInit {
       return true;
     }
 
-    // Calculate punctuality using system local hour/minute
     const currentMins = localHour * 60 + localMin;
     const startMins = activeService.startTimeHour * 60 + activeService.startTimeMinute;
-    const minutes_difference = currentMins - startMins; // Negative = early, positive = late
+    const minutes_difference = currentMins - startMins;
 
     let punctuality_status = 'On Time';
     if (minutes_difference < -15) punctuality_status = 'Early';
     else if (minutes_difference > 15) punctuality_status = 'Late';
 
-    // Create attendance record
     const { data: newRecord, error } = await client
       .from('attendance')
       .insert({
@@ -360,7 +410,6 @@ export class RecognitionProcessingService implements OnModuleInit {
       return false;
     }
 
-    // Emit live Socket.io event to frontend UI
     this.recognitionGateway.broadcastAttendanceMarked({
       id: newRecord.id,
       memberName: `${member.first_name} ${member.last_name}`,
@@ -369,7 +418,7 @@ export class RecognitionProcessingService implements OnModuleInit {
       serviceType,
       status: 'Present'
     });
-    return false; // not "already marked", it was a fresh mark!
+    return false;
   }
 
   /**
@@ -385,7 +434,6 @@ export class RecognitionProcessingService implements OnModuleInit {
       let snapshotUrl = '';
       let cropUrl = '';
 
-      // Upload files to Supabase Storage if buffers are non-empty
       if (snapshot && snapshot.length > 0) {
         const snapshotPath = `snapshots/${visitorId}_snapshot.jpg`;
         const { error: err1 } = await client.storage
@@ -412,15 +460,10 @@ export class RecognitionProcessingService implements OnModuleInit {
         }
       }
 
-      // Default fallback images for demonstration if upload is bypassed
-      // if (!snapshotUrl) snapshotUrl = 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=400';
-      // if (!cropUrl) cropUrl = 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150';
-
       if (!snapshotUrl || !cropUrl) {
         throw new Error('Failed to upload snapshot or crop to Supabase Storage.');
       }
 
-      // Insert visitor record
       const insertPayload: any = {
         id: visitorId,
         captured_face_url: cropUrl,
@@ -447,7 +490,6 @@ export class RecognitionProcessingService implements OnModuleInit {
       }
       this.logger.log(`Visitor saved to database: ${visitor.id}`);
 
-      // Broadcast WebSocket notification to dashboard
       const location = cameraId ? await this.getCameraLocation(cameraId) : 'Live Kiosk';
       this.recognitionGateway.broadcastVisitorDetected({
         id: visitorId,
@@ -457,35 +499,28 @@ export class RecognitionProcessingService implements OnModuleInit {
         cameraName,
         location
       });
-    } catch (err) {
+    } catch (err: any) {
       this.logger.error(`Failed to record unrecognized visitor: ${err?.message || err}`);
     }
   }
 
   private getActiveServiceDetails(localNow: Date): { name: string, startTimeHour: number, startTimeMinute: number } {
-    // ─── DEVELOPER TEST OVERRIDE ──────────────────────────────────────────────
-    // If DEV_SERVICE_OVERRIDE is set in .env, skip real-time detection entirely.
-    // Remove the env var before going live.
     const devOverride = process.env.DEV_SERVICE_OVERRIDE?.trim();
     if (devOverride) {
       this.logger.warn(`[DEV MODE] Service overridden to: "${devOverride}" — remove DEV_SERVICE_OVERRIDE from .env for production!`);
       return { name: devOverride, startTimeHour: localNow.getHours(), startTimeMinute: localNow.getMinutes() };
     }
-    // ─────────────────────────────────────────────────────────────────────────
 
-    const day = localNow.getDay();       // 0=Sun,1=Mon,2=Tue,3=Wed,4=Thu,5=Fri,6=Sat
+    const day = localNow.getDay();
     const hour = localNow.getHours();
     const mins = localNow.getMinutes();
     const currentMins = hour * 60 + mins;
 
-
-    // Helper to determine Sunday theme based on week-of-month
     const getSundayTheme = (d: Date) => {
       const dayOfMonth = d.getDate();
       const month = d.getMonth();
       const year = d.getFullYear();
       const daysInMonth = new Date(year, month + 1, 0).getDate();
-      // Find last Sunday of month
       const lastDay = new Date(year, month, daysInMonth);
       const lastSundayDate = daysInMonth - lastDay.getDay();
 
@@ -495,8 +530,6 @@ export class RecognitionProcessingService implements OnModuleInit {
       return 'Normal Service';
     };
 
-    // ----- Service Schedule (HCC Achievers Arena Abuja) -----
-    // Sunday: First Service 8am–10am, Second Service 10am–12pm
     if (day === 0) {
       const theme = getSundayTheme(localNow);
       if (currentMins >= 7 * 60 && currentMins < 10 * 60) {
@@ -507,17 +540,14 @@ export class RecognitionProcessingService implements OnModuleInit {
       }
     }
 
-    // Tuesday: Breakthrough Fire Service 9am–11am
     if (day === 2 && currentMins >= 8 * 60 && currentMins <= 12 * 60) {
       return { name: 'Breakthrough Fire Service', startTimeHour: 9, startTimeMinute: 0 };
     }
 
-    // Thursday: Empowerment Service 5:30pm–7:30pm
     if (day === 4 && currentMins >= 16 * 60 && currentMins <= 21 * 60) {
       return { name: 'Empowerment Service', startTimeHour: 17, startTimeMinute: 30 };
     }
 
-    // Outside scheduled service hours — label clearly as practice/testing
     return { name: 'Practice / Testing Session', startTimeHour: hour, startTimeMinute: mins };
   }
 

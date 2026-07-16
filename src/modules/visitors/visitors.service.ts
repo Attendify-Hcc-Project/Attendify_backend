@@ -59,6 +59,7 @@ export class VisitorsService {
       gender: string;
       dateOfBirth?: string;
       department?: string;
+      address?: string;
     },
   ) {
     const client = this.supabaseService.getClient();
@@ -83,6 +84,7 @@ export class VisitorsService {
       gender: memberData.gender,
       dateOfBirth: memberData.dateOfBirth,
       department: memberData.department,
+      address: memberData.address,
       profilePhotoUrl: visitor.captured_face_url || null,
       status: 'Active',
     });

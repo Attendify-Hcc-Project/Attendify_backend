@@ -25,4 +25,8 @@ export class PromoteVisitorDto {
   @IsOptional()
   @IsString()
   dateOfBirth?: string;
+
+  @IsOptional()
+  @IsString()
+  address?: string;
 }

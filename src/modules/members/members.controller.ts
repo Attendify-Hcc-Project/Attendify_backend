@@ -18,11 +18,15 @@ import { AuthGuard } from '../../common/guards/auth.guard';
 import { RolesGuard } from '../../common/guards/roles.guard';
 import { Roles } from '../../common/decorators/roles.decorator';
 import { MembersService } from './members.service';
+import { EmailService } from './email.service';
 
 @Controller('members')
 @UseGuards(AuthGuard, RolesGuard)
 export class MembersController {
-  constructor(private readonly membersService: MembersService) {}
+  constructor(
+    private readonly membersService: MembersService,
+    private readonly emailService: EmailService,
+  ) {}
 
   @Get()
   @Roles('Super Admin', 'Church Admin', 'Attendance Officer', 'Pastor', 'Viewer')
@@ -85,6 +89,7 @@ export class MembersController {
       department?: string;
       status?: string;
       profilePhotoUrl?: string;
+      address?: string;
     },
   ) {
     return this.membersService.update(id, body);
@@ -94,6 +99,27 @@ export class MembersController {
   @Roles('Super Admin', 'Church Admin')
   async deleteMember(@Param('id') id: string) {
     return this.membersService.remove(id);
+  }
+
+  @Post(':id/send-qr-email')
+  @Roles('Super Admin', 'Church Admin', 'Attendance Officer')
+  async sendQrEmail(@Param('id') id: string) {
+    const member = await this.membersService.findOne(id);
+    if (!member.email) {
+      throw new HttpException('Member does not have an email address', HttpStatus.BAD_REQUEST);
+    }
+    if (!member.qr_code) {
+      throw new HttpException('Member does not have a QR code', HttpStatus.BAD_REQUEST);
+    }
+    const result = await this.emailService.sendQrCode(
+      member.email,
+      member.full_name || `${member.first_name} ${member.last_name}`,
+      member.qr_code,
+    );
+    if (!result.success) {
+      throw new HttpException(result.message, HttpStatus.SERVICE_UNAVAILABLE);
+    }
+    return result;
   }
 
   @Post(':id/faces')
