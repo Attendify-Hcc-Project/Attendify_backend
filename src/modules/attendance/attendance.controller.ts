@@ -9,6 +9,27 @@ import { AttendanceService } from './attendance.service';
 export class AttendanceController {
   constructor(private readonly attendanceService: AttendanceService) { }
 
+
+  @Get('stats/report-summary')
+  async getReportSummary() {
+    return this.attendanceService.reportSummary();
+  }
+
+  @Get('stats/monthly-overview')
+  async getMonthlyOverview() {
+    return this.attendanceService.monthlyOverview();
+  }
+
+  @Get('stats/group-breakdown')
+  async getGroupBreakdown() {
+    return this.attendanceService.groupBreakdown();
+  }
+
+  @Get('stats/session-trend')
+  async getSessionTrend() {
+    return this.attendanceService.sessionTrend();
+  }
+
   @Get('stats/today')
   async getTodayStats() {
     return this.attendanceService.todayStats();
@@ -132,4 +153,40 @@ export class AttendanceController {
     }
     return this.attendanceService.markAttendance(body);
   }
+
+  @Get('export/:format')
+  @Roles('Super Admin', 'Church Admin', 'Pastor')
+  async exportFormat(
+    @Param('format') format: string,
+    @Query('date') date: string,
+    @Query('serviceType') serviceType: string,
+    @Res() res: Response,
+  ) {
+    const filters = { date, serviceType };
+    
+    if (format === 'csv') {
+      const csv = await this.attendanceService.exportCsv(filters);
+      res.header('Content-Type', 'text/csv');
+      res.attachment('attendance.csv');
+      return res.send(csv);
+    } else if (format === 'xlsx') {
+      const buffer = await this.attendanceService.exportExcel(filters);
+      res.header('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.attachment('attendance.xlsx');
+      return res.send(buffer);
+    } else if (format === 'pdf') {
+      const buffer = await this.attendanceService.exportPdf(filters);
+      res.header('Content-Type', 'application/pdf');
+      res.attachment('attendance.pdf');
+      return res.send(buffer);
+    } else if (format === 'docx') {
+      const buffer = await this.attendanceService.exportDocx(filters);
+      res.header('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+      res.attachment('attendance.docx');
+      return res.send(buffer);
+    }
+    
+    return res.status(400).send('Invalid format');
+  }
+
 }
