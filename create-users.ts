@@ -18,8 +18,8 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 
 async function createUsers() {
   const users = [
-    { email: 'sunnytoby9@gmail.com', password: '11111111', role: 'Usher' },
-    { email: 'triumphcodes@gmail.com', password: '11111111', role: 'First-Timer Officer' }
+    { email: 'sunnytoby9@gmail.com', password: '20022002', role: 'Usher' },
+    { email: 'triumphcodes@gmail.com', password: '20022002', role: 'First-Timer Officer' }
   ];
 
   for (const u of users) {
